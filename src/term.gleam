@@ -43,8 +43,14 @@ pub type Pterm {
   Chan
   // syntaxe Send(chan, content) : chan <- content
   Send(chan: Pterm, content: Pterm)
-  // syntax Recv(chan) : <- chan
+  // syntaxe Recv(chan) : <- chan
   Recv(chan: Pterm)
+  // syntaxe Str("a") : "a"
+  Str(content: String)
+  // syntaxe Print(expr) : print(expr)
+  Print(expr: Pterm)
+  // syntaxe Println(expr) : println(expr)
+  Println(expr: Pterm)
 }
 
 fn string_of_term_app(term: Pterm, ident: Int) -> String {
@@ -160,6 +166,10 @@ pub fn string_of_term(term: Pterm, ident: Int) -> String {
       ])
     }
     Recv(chan) -> string.append(" <- ", string_of_term(chan, ident))
+    Str(content) -> string.concat(["\"", content, "\""])
+    Print(expr) -> string.concat(["print(", string_of_term(expr, ident), ")"])
+    Println(expr) ->
+      string.concat(["println(", string_of_term(expr, ident), ")"])
   }
 }
 
@@ -226,9 +236,9 @@ pub fn is_expansive(term: Pterm) -> Bool {
     Ref(_) -> True
     Fork(expr1, expr2) -> is_expansive(expr1) || is_expansive(expr2)
     Chan -> True
-    Send(_, content) -> is_expansive(content)
+    Send(_, _) -> True
     // TODO: careful
-    Recv(chan) -> is_expansive(chan)
+    Recv(_) -> True
     _ -> False
   }
 }

@@ -1,15 +1,15 @@
-import gleam/erlang/atom
 import gleam/erlang/charlist
 import gleam/io
+import gleam/option.{type Option, None, Some}
 import gleam/string
 import gleeunit
 import interpreter
 import parser
 import term.{
   type Pterm, Abs, Add, App, Assign, Chan, Cons, Deref, Empty, Fork, Head, Ife,
-  Ifz, Integer, Let, Recv, Ref, Send, Tail, Unit, Var,
+  Ifz, Integer, Let, Print, Println, Recv, Ref, Send, Str, Tail, Unit, Var,
 }
-import typing
+import typing.{type Ptype, Tapp, Tchan, Tinteger, Tlist, Tref, Tstr, Tunit, Tvar}
 
 pub fn main() {
   gleeunit.main()
@@ -20,7 +20,7 @@ fn print_test(term: Pterm, res: Result(typing.Ptype, typing.InferrenceError)) {
   case res {
     Ok(ty) -> {
       let type_string = typing.string_of_type(typing.pretty_rename(ty))
-      io.println(
+      io.print(
         string.concat([
           "Term:\n",
           term_string,
@@ -31,7 +31,7 @@ fn print_test(term: Pterm, res: Result(typing.Ptype, typing.InferrenceError)) {
       )
     }
     Error(typing.UnificationError(msg, #(ty1, ty2))) ->
-      io.println(
+      io.print(
         string.concat([
           "Term:\n",
           term_string,
@@ -45,13 +45,26 @@ fn print_test(term: Pterm, res: Result(typing.Ptype, typing.InferrenceError)) {
         ]),
       )
     Error(err) ->
-      io.println(
+      io.print(
         string.concat(["Term:\n", term_string, "\nFAILED: ", err.msg, "\n"]),
       )
   }
 }
 
+fn test_infer(term: Pterm, expected: Option(Ptype)) {
+  let identity_type = typing.inference(term)
+  print_test(term, identity_type)
+  io.print("expected: ")
+  case expected {
+    Some(t) -> io.println(typing.string_of_type(t))
+    None -> io.println("Error")
+  }
+  io.println("")
+}
+
 const identity_term = Abs("y", Var("y"))
+
+const expected_identity = Some(Tapp(Tvar("a"), Tvar("a")))
 
 const k_term = Abs("x", Abs("y", Var("x")))
 
@@ -134,7 +147,7 @@ const let_ref_term = Let(
   Let("_", Assign(Var("x"), Integer(1)), Deref(Var("x"))),
 )
 
-const let_ref_expected_type = typing.Tinteger
+const let_ref_expected_type = Some(Tinteger)
 
 const let_ref_expected_value = Integer(1)
 
@@ -180,20 +193,63 @@ const weak_chan_term3 = Let(
       "func",
       Recv(Var("c")),
       App(
-        Abs("y", App(Var("func"), Unit)),
+        Abs("w", App(Var("func"), Unit)),
         App(Var("func"), Abs("z", App(s_term, Var("z")))),
       ),
     ),
   ),
 )
 
-fn test_infer(term: Pterm) {
-  let identity_type = typing.inference(term)
-  print_test(term, identity_type)
-}
+const func_term1 = Let(
+  "func",
+  Abs("y", Var("y")),
+  Abs("z", App(Var("func"), Unit)),
+)
+
+const func_term2 = Let(
+  "func",
+  identity_term,
+  App(Var("func"), Abs("z", App(s_term, Var("z")))),
+)
+
+const weak_chan_test = Let(
+  "c",
+  Chan,
+  Let("i", Recv(Var("c")), Add(Var("i"), Integer(0))),
+)
+
+const str_term = Str("Hello World")
+
+const str_expected_type = Some(Tstr)
+
+const print_test_term = Print(str_term)
+
+const println_test_term = Println(str_term)
+
+const print_expected_type = Some(Tunit)
+
+const fork_test = Let(
+  "c",
+  Chan,
+  Fork(
+    Let("a", Recv(Var("c")), Println(Var("a"))),
+    Fork(
+      Let("b", Recv(Var("c")), Println(Var("b"))),
+      Fork(
+        Let("d", Recv(Var("c")), Println(Var("d"))),
+        Fork(
+          Send(Var("c"), Str("a")),
+          Fork(Send(Var("c"), Str("b")), Send(Var("c"), Str("d"))),
+        ),
+      ),
+    ),
+  ),
+)
+
+const fork_test_expected_type = Some(Tunit)
 
 pub fn inference_test() {
-  test_infer(identity_term)
+  test_infer(identity_term, expected_identity)
 
   let k_type = typing.inference(k_term)
   print_test(k_term, k_type)
@@ -264,6 +320,23 @@ pub fn inference_test() {
 
   let weak_chan_type3 = typing.inference(weak_chan_term3)
   print_test(weak_chan_term3, weak_chan_type3)
+
+  let func_type1 = typing.inference(func_term1)
+  print_test(func_term1, func_type1)
+
+  let func_type2 = typing.inference(func_term2)
+  print_test(func_term2, func_type2)
+
+  let weak_chan_test_type = typing.inference(weak_chan_test)
+  print_test(weak_chan_test, weak_chan_test_type)
+
+  test_infer(str_term, str_expected_type)
+
+  test_infer(print_test_term, print_expected_type)
+
+  test_infer(println_test_term, print_expected_type)
+
+  test_infer(fork_test, fork_test_expected_type)
 }
 
 fn interpret_term(term: Pterm, expected: Pterm) {
@@ -289,6 +362,12 @@ pub fn interpreter_test() {
   interpret_term(let_ref_term, let_ref_expected_value)
 
   interpret_term(ref_ref_term, ref_ref_expected_value)
+
+  interpret_term(str_term, str_term)
+  interpret_term(print_test_term, Unit)
+  interpret_term(println_test_term, Unit)
+
+  interpret_term(fork_test, Unit)
 }
 
 pub fn lexer_test() {

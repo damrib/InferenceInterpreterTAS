@@ -121,6 +121,11 @@ fn alpha_conversion_auxiliary(
       alpha_conversion_auxiliary(content, name_table, counter)
       |> term.Send(new_chan, _)
     }
+    term.Str(_) -> term
+    term.Print(expr) ->
+      alpha_conversion_auxiliary(expr, name_table, counter) |> term.Print
+    term.Println(expr) ->
+      alpha_conversion_auxiliary(expr, name_table, counter) |> term.Println
   }
 }
 

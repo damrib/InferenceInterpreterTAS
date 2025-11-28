@@ -12,7 +12,7 @@ pub fn new() -> Bitable(k, v) {
 
 fn key_duplicates(value_table: Dict(v, List(k)), key: k) -> Bool {
   dict.fold(value_table, False, fn(b, _, keys) {
-    b || !list.any(keys, fn(e) { e == key })
+    b || list.any(keys, fn(e) { e == key })
   })
 }
 

@@ -1,3 +1,5 @@
+import gleam/erlang/process
+import gleam/io
 import gleam/result
 import memory
 import term
@@ -5,6 +7,7 @@ import term
 pub type InterpreterError {
   MemoryException(memory.MemoryError)
   RuntimeException(msg: String)
+  Deadlock(msg: String)
 }
 
 fn eval_add(
@@ -34,10 +37,15 @@ fn eval_app(
       use eval <- result.try(eval_term(new_term, mem))
       Ok(term.Abs(name, eval))
     }
+    term.App(term1, term2) -> {
+      use new_term1 <- result.try(eval_app(var, arg, term1, mem))
+      use new_term2 <- result.try(eval_app(var, arg, term2, mem))
+      Ok(term.App(new_term1, new_term2))
+    }
     term.Add(term1, term2) -> {
       use new_term1 <- result.try(eval_app(var, arg, term1, mem))
       use new_term2 <- result.try(eval_app(var, arg, term2, mem))
-      eval_add(new_term1, new_term2, mem)
+      Ok(term.Add(new_term1, new_term2))
     }
     term.Cons(t1, rest) -> {
       use new_t1 <- result.try(eval_app(var, arg, t1, mem))
@@ -52,7 +60,70 @@ fn eval_app(
       use new_t <- result.try(eval_app(var, arg, t, mem))
       Ok(term.Tail(new_t))
     }
-    _ -> Ok(body)
+    term.Ref(t) -> {
+      use new_t <- result.try(eval_app(var, arg, t, mem))
+      Ok(term.Ref(new_t))
+    }
+    term.Ife(cond, then, els) -> {
+      use new_cond <- result.try(eval_app(var, arg, cond, mem))
+      use new_then <- result.try(eval_app(var, arg, then, mem))
+      use new_else <- result.try(eval_app(var, arg, els, mem))
+      Ok(term.Ife(new_cond, new_then, new_else))
+    }
+    term.Ifz(cond, then, els) -> {
+      use new_cond <- result.try(eval_app(var, arg, cond, mem))
+      use new_then <- result.try(eval_app(var, arg, then, mem))
+      use new_else <- result.try(eval_app(var, arg, els, mem))
+      Ok(term.Ifz(new_cond, new_then, new_else))
+    }
+    term.Assign(ref, expr) -> {
+      use new_ref <- result.try(eval_app(var, arg, ref, mem))
+      use new_expr <- result.try(eval_app(var, arg, expr, mem))
+      Ok(term.Assign(new_ref, new_expr))
+    }
+    term.Deref(ref) -> {
+      use new_ref <- result.try(eval_app(var, arg, ref, mem))
+      Ok(term.Deref(new_ref))
+    }
+    term.Fork(expr1, expr2) -> {
+      use new_expr1 <- result.try(eval_app(var, arg, expr1, mem))
+      use new_expr2 <- result.try(eval_app(var, arg, expr2, mem))
+      Ok(term.Fork(new_expr1, new_expr2))
+    }
+    term.Let(name, bind, expr) if name != var -> {
+      use new_bind <- result.try(eval_app(var, arg, bind, mem))
+      use new_expr <- result.try(eval_app(var, arg, expr, mem))
+      Ok(term.Let(name, new_bind, new_expr))
+    }
+    term.Print(expr) -> {
+      use new_expr <- result.try(eval_app(var, arg, expr, mem))
+      Ok(term.Print(new_expr))
+    }
+    term.Println(expr) -> {
+      use new_expr <- result.try(eval_app(var, arg, expr, mem))
+      Ok(term.Println(new_expr))
+    }
+    term.Rec(name, fun) if name != var -> {
+      use new_fun <- result.try(eval_app(var, arg, fun, mem))
+      Ok(term.Rec(name, new_fun))
+    }
+    term.Send(chan, _) -> {
+      use new_chan <- result.try(eval_app(var, arg, chan, mem))
+      use new_content <- result.try(eval_app(var, arg, chan, mem))
+      Ok(term.Send(new_chan, new_content))
+    }
+    term.Recv(chan) -> {
+      use new_chan <- result.try(eval_app(var, arg, chan, mem))
+      Ok(term.Recv(new_chan))
+    }
+    term.Str(_)
+    | term.Integer(_)
+    | term.Abs(_, _)
+    | term.Let(_, _, _)
+    | term.Rec(_, _)
+    | term.Unit
+    | term.Chan
+    | term.Empty -> Ok(body)
   }
 }
 
@@ -100,12 +171,32 @@ pub fn eval_ife(
   }
 }
 
+fn eval_fork(
+  term: term.Pterm,
+  memory: memory.MemoryActor,
+) -> Result(term.Pterm, InterpreterError) {
+  case term {
+    term.Fork(expr1, expr2) -> {
+      process.spawn(fn() { eval_term(expr2, memory) })
+      use _ <- result.try(eval_term(expr1, memory))
+      Ok(term.Unit)
+    }
+    _ -> {
+      use _ <- result.try(eval_term(term, memory))
+      Ok(term.Unit)
+    }
+  }
+}
+
 pub fn eval_term(
   term: term.Pterm,
   memory: memory.MemoryActor,
 ) -> Result(term.Pterm, InterpreterError) {
   case term {
-    term.App(term.Abs(var, t), arg) -> eval_app(var, arg, t, memory)
+    term.App(term.Abs(var, t), arg) -> {
+      use new_term <- result.try(eval_app(var, arg, t, memory))
+      eval_term(new_term, memory)
+    }
     term.App(t1, t2) -> {
       use new_t1 <- result.try(eval_term(t1, memory))
       use new_t2 <- result.try(eval_term(t2, memory))
@@ -126,23 +217,30 @@ pub fn eval_term(
     }
     term.Ifz(cond, then, els) -> eval_ifz(cond, then, els, memory)
     term.Ife(cond, then, els) -> eval_ife(cond, then, els, memory)
-    // TODO SEE IF NOT BETTER TO LET MEMORY ACTOR CHANGE NAME OF VAR
-    term.Let(var, term.Ref(_) as t, expr) -> {
-      use new_term <- result.try(eval_term(t, memory))
-      memory.new_mem(memory, var, new_term)
-      eval_term(expr, memory)
-    }
     term.Let(var, bind, expr) -> {
       use new_bind <- result.try(eval_term(bind, memory))
-      use new_expr <- result.try(eval_app(var, new_bind, expr, memory))
-      eval_term(new_expr, memory)
+      case new_bind {
+        term.Ref(t) -> {
+          use new_term <- result.try(eval_term(t, memory))
+          memory.new_mem(memory, var, term.Ref(new_term))
+          eval_term(expr, memory)
+        }
+        term.Chan -> {
+          memory.channel_mem(memory, var)
+          eval_term(expr, memory)
+        }
+        _ -> {
+          use new_expr <- result.try(eval_app(var, new_bind, expr, memory))
+          eval_term(new_expr, memory)
+        }
+      }
     }
     // TODO
     term.Rec(var, fun) -> eval_app(var, term, fun, memory)
     term.Deref(expr) -> {
       use ref <- result.try(eval_term(expr, memory))
       case ref {
-        term.Ref(t) -> Ok(t)
+        term.Ref(t) -> eval_term(t, memory)
         term.Var(region) ->
           memory.access_mem(memory, region) |> result.map_error(MemoryException)
         _ -> {
@@ -163,11 +261,47 @@ pub fn eval_term(
         // in the right term
         term.Ref(_) -> Nil
         _ -> {
-          echo region_term
           panic as "should not happen"
         }
       }
       Ok(term.Unit)
+    }
+    term.Print(t) -> {
+      use string_term <- result.try(eval_term(t, memory))
+      io.print(term.string_of_term(string_term, 0))
+      Ok(term.Unit)
+    }
+    term.Println(t) -> {
+      use string_term <- result.try(eval_term(t, memory))
+      io.println(term.string_of_term(string_term, 0))
+      Ok(term.Unit)
+    }
+    term.Fork(_, _) -> eval_fork(term, memory)
+    term.Recv(chan_expr) -> {
+      use chan <- result.try(eval_term(chan_expr, memory))
+      case chan {
+        term.Var(name) -> {
+          memory.recv_message(memory, name)
+          |> result.map_error(fn(err) { MemoryException(err) })
+        }
+        term.Chan -> Error(Deadlock("Reception on an unbinded channel"))
+        _ -> panic as "should not happen"
+      }
+    }
+    term.Send(chan_expr, term) -> {
+      use chan <- result.try(eval_term(chan_expr, memory))
+      use val <- result.try(eval_term(term, memory))
+      case chan {
+        term.Var(name) -> {
+          use _ <- result.try(
+            memory.send_message(memory, name, val)
+            |> result.map_error(fn(err) { MemoryException(err) }),
+          )
+          Ok(val)
+        }
+        term.Chan -> Error(Deadlock("Message sent on an unbinded channel"))
+        _ -> panic as "should not happen"
+      }
     }
     _ -> Ok(term)
   }

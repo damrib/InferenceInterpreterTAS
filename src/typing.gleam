@@ -2,13 +2,12 @@ import alpha
 import bitable
 import gleam/dict
 import gleam/int
-import gleam/io
 import gleam/list
 import gleam/result
 import gleam/string
 import term.{
   type Pterm, Abs, Add, App, Assign, Chan, Cons, Deref, Empty, Fork, Head, Ife,
-  Ifz, Integer, Let, Rec, Recv, Ref, Send, Tail, Unit, Var,
+  Ifz, Integer, Let, Print, Println, Rec, Recv, Ref, Send, Str, Tail, Unit, Var,
 }
 
 pub type Ptype {
@@ -16,12 +15,11 @@ pub type Ptype {
   Tapp(ty1: Ptype, ty2: Ptype)
   Tlist(ty: Ptype)
   Tinteger
+  Tstr
   Tunit
   Tref(ty: Ptype)
-  // Weak(String)?
-  Weak(ty: Ptype)
   Tchan(ty: Ptype)
-
+  Weak(ty: String)
   // only used during the unification
   Polymorphic(ty: Ptype)
 }
@@ -60,6 +58,8 @@ pub fn type_equality(ty1: Ptype, ty2: Ptype) -> Bool {
   }
 }
 
+/// this function is used to display prettier type names and to avoid confusing
+/// ('_v2 -> '_v2) ref with '_v2 -> ('_v2 ref)
 fn string_of_type_aux(ptype: Ptype) -> String {
   case ptype {
     Tapp(ty1, ty2) -> {
@@ -79,12 +79,13 @@ pub fn string_of_type(ptype: Ptype) -> String {
       let string_type2 = string_of_type_aux(ty2)
       string.concat([string_type1, " -> ", string_type2])
     }
-    Tref(ty) -> string.append(string_of_type(ty), " ref")
+    Tref(ty) -> string.append(string_of_type_aux(ty), " ref")
     Tlist(ty) -> string.append(string_of_type(ty), " list")
     Tchan(ty) -> string.append(string_of_type(ty), " chan")
     Tunit -> "unit"
     Tinteger -> "int"
-    Weak(ty) -> string.append("'_", string_of_type(ty))
+    Tstr -> "str"
+    Weak(ty) -> string.append("'_", ty)
     Polymorphic(ty) -> string.append("'", string_of_type(ty))
   }
 }
@@ -130,25 +131,6 @@ fn get_type(env: TypingEnv, var: String) -> Result(Ptype, Nil) {
   }
 }
 
-fn to_weak(ty: Ptype, goal_string: String, counter: CounterActor) -> Ptype {
-  case ty {
-    Tvar(var_name) if var_name != goal_string -> {
-      let new_name = alpha.new_var(counter)
-      Weak(Tvar(new_name))
-    }
-    Tapp(t1, t2) -> {
-      let new_t1 = to_weak(t1, goal_string, counter)
-      let new_t2 = to_weak(t2, goal_string, counter)
-      Tapp(new_t1, new_t2)
-    }
-    Tlist(t1) -> to_weak(t1, goal_string, counter) |> Tlist
-    Tref(t1) -> to_weak(t1, goal_string, counter) |> Tref
-    Tchan(t1) -> to_weak(t1, goal_string, counter) |> Tref
-    Polymorphic(_) -> panic as "should not happen"
-    _ -> ty
-  }
-}
-
 fn propagate_weak(
   env: TypingEnv,
   weaks: WeakTable,
@@ -157,9 +139,8 @@ fn propagate_weak(
   case ty {
     Tvar(name) -> {
       // TODO : delete weaks from env
-      let new_env = dict.insert(env, name, Weak(ty))
-      let new_weaks = bitable.insert_key(weaks, name, Weak(ty))
-      #(new_env, new_weaks, Weak(ty))
+      let new_weaks = bitable.insert_key(weaks, name, Weak(name))
+      #(env, new_weaks, Weak(name))
     }
     Tlist(t1) -> {
       let #(new_env, new_weaks, new_ty) = propagate_weak(env, weaks, t1)
@@ -229,9 +210,10 @@ fn substitute_type(
     Tchan(ty1) -> substitute_type(weaks, ty1, var, new_ty) |> Tchan
     Tlist(ty1) -> substitute_type(weaks, ty1, var, new_ty) |> Tlist
     Tref(ty1) -> substitute_type(weaks, ty1, var, new_ty) |> Tref
-    Weak(Tvar(name)) -> {
+    Weak(name) -> {
       case bitable.get_value(weaks, name) {
         Ok(res) -> res
+        // TODO
         Error(_) -> ty
       }
     }
@@ -279,7 +261,7 @@ fn generate_list_equations(
 
 fn weak_type_or(weaks: WeakTable, ty: Ptype) -> Ptype {
   case ty {
-    Weak(Tvar(name)) -> {
+    Weak(name) -> {
       case bitable.get_value(weaks, name) {
         Ok(res) -> res
         Error(_) -> ty
@@ -503,12 +485,18 @@ fn generate_equations_auxiliary(
       //      env |- channel : ty chan         env |- message : ty
       // ---------------------------------------------------------
       //       env |- Send(channel, message) : ty
-      // TODO: ajout weak pour chan?
-      generate_equations_auxiliary(
-        acc,
-        [#(chan, Tchan(ty), env), #(message, ty, env), ..rest],
+      // TODO: ajout weak pour chan? Care bug env diff left right
+      use #(new_weaks, new_ty) <- result.try(inference_auxiliary(
+        message,
+        env,
         counter,
         weaks,
+      ))
+      generate_equations_auxiliary(
+        [#(new_ty, ty), ..acc],
+        [#(chan, Tchan(new_ty), env), ..rest],
+        counter,
+        new_weaks,
       )
     }
     [#(Recv(chan), ty, env), ..rest] -> {
@@ -529,7 +517,6 @@ fn generate_equations_auxiliary(
         counter,
         weaks,
       ))
-      echo new_weaks
       use #(new_weaks, _) <- result.try(inference_auxiliary(
         expr2,
         env,
@@ -541,6 +528,16 @@ fn generate_equations_auxiliary(
         rest,
         counter,
         new_weaks,
+      )
+    }
+    [#(Str(_), ty, _), ..rest] ->
+      generate_equations_auxiliary([#(ty, Tstr), ..acc], rest, counter, weaks)
+    [#(Print(t), ty, env), ..rest] | [#(Println(t), ty, env), ..rest] -> {
+      generate_equations_auxiliary(
+        [#(ty, Tunit), ..acc],
+        [#(t, Tstr, env), ..rest],
+        counter,
+        weaks,
       )
     }
   }
@@ -604,12 +601,7 @@ fn unification_auxiliary(
   weaks: WeakTable,
 ) -> Result(#(WeakTable, Ptype), InferrenceError) {
   case equations {
-    [] -> {
-      result.replace_error(
-        get_var_type(treated, goal, weaks),
-        GoalNotReached("The term is not typeable"),
-      )
-    }
+    [] -> get_var_type(treated, goal, weaks)
     [#(Polymorphic(t1), t2), ..rest] | [#(t2, Polymorphic(t1)), ..rest] -> {
       let new_ty1 = poly_rename(t1, counter)
       unification_auxiliary(
@@ -620,11 +612,18 @@ fn unification_auxiliary(
         weaks,
       )
     }
-    [#(Weak(Tvar(v)), t), ..rest] | [#(t, Weak(Tvar(v))), ..rest] -> {
+    [#(Weak(v), t), ..rest] | [#(t, Weak(v)), ..rest] -> {
+      // TODO care potential bug after replacing rest by equations
       let new_equations =
         substitute_type_equations(weaks, list.append(rest, treated), v, t)
       let new_weaks = bitable.insert_key(weaks, v, t)
-      unification_auxiliary(new_equations, [], goal, counter, new_weaks)
+      unification_auxiliary(
+        new_equations,
+        [#(Tvar(v), t)],
+        goal,
+        counter,
+        new_weaks,
+      )
     }
     [#(Tvar(v), _) as g, ..rest] | [#(_, Tvar(v)) as g, ..rest] if v == goal ->
       unification_auxiliary(rest, [g, ..treated], goal, counter, weaks)
@@ -633,9 +632,11 @@ fn unification_auxiliary(
         False -> {
           let new_equations =
             substitute_type_equations(weaks, list.append(rest, treated), v, t2)
-          let new_weaks = bitable.replace_value(weaks, Weak(t1), t2)
+          // TODO: CARE BUG Weak(t1)?
+          let new_weaks = bitable.replace_value(weaks, t1, t2)
           unification_auxiliary(new_equations, [], goal, counter, new_weaks)
         }
+
         True ->
           Error(
             UnificationError(
@@ -653,11 +654,14 @@ fn unification_auxiliary(
         counter,
         weaks,
       )
-    [#(Tapp(_, _) as t1, t2), ..] | [#(t1, Tapp(_, _) as t2), ..] ->
+    [#(Tapp(_, _) as t1, t2), ..] | [#(t1, Tapp(_, _) as t2), ..] -> {
       Error(
         UnificationError("cannot unify app and non application type", #(t1, t2)),
       )
-    [#(Tinteger, Tinteger), ..rest] | [#(Tunit, Tunit), ..rest] ->
+    }
+    [#(Tinteger, Tinteger), ..rest]
+    | [#(Tunit, Tunit), ..rest]
+    | [#(Tstr, Tstr), ..rest] ->
       unification_auxiliary(rest, treated, goal, counter, weaks)
     [#(Tlist(ty1), Tlist(ty2)), ..rest] ->
       unification_auxiliary(
@@ -699,8 +703,9 @@ fn unification(
   equations: Equations,
   counter: CounterActor,
 ) -> Result(Ptype, InferrenceError) {
-  unification_auxiliary(equations, [], goal_string, counter, bitable.new())
-  |> result.map(fn(ok) { ok.1 })
+  let res =
+    unification_auxiliary(equations, [], goal_string, counter, bitable.new())
+  result.map(res, fn(ok) { ok.1 })
 }
 
 type CounterActor =
@@ -739,7 +744,8 @@ fn enumerate_type_name(ty: Ptype, acc: List(String)) -> List(String) {
     Tchan(ty) -> enumerate_type_name(ty, acc)
     Tunit -> acc
     Tinteger -> acc
-    Weak(ty) -> enumerate_type_name(ty, acc)
+    Tstr -> acc
+    Weak(ty) -> [ty, ..acc]
     Polymorphic(ty) -> enumerate_type_name(ty, acc)
   }
 }
@@ -767,9 +773,9 @@ fn change_var_name(ty: Ptype, d: dict.Dict(String, String)) -> Ptype {
       let new_ty = change_var_name(ty, d)
       Tlist(new_ty)
     }
-    Weak(t) -> {
-      let new_ty = change_var_name(t, d)
-      Weak(new_ty)
+    Weak(name) -> {
+      let assert Ok(new_name) = dict.get(d, name)
+      Weak(new_name)
     }
     t -> t
   }
