@@ -1,4 +1,5 @@
 import gleam/erlang/charlist
+import gleam/list
 import term
 
 pub type Tokens
@@ -11,24 +12,43 @@ pub type ParserAtom {
   Atom(Int, content: String)
 }
 
-pub type ParserTerm {
+pub type ParserInteger {
+  Integer(Int, content: Int)
+}
+
+pub type ParserField {
+  Field(name: ParserAtom, body: ParserTerm)
+}
+
+pub opaque type ParserTerm {
   Var(ParserAtom)
   App(ParserTerm, ParserTerm)
   Abs(ParserAtom, ParserTerm)
-  Integer(Int)
+  Int(ParserInteger)
   Add(ParserTerm, ParserTerm)
+  Sub(ParserTerm, ParserTerm)
   Empty
   Head(ParserTerm)
   Tail(ParserTerm)
   Cons(ParserTerm, ParserTerm)
   Ifz(ParserTerm, ParserTerm, ParserTerm)
   Ife(ParserTerm, ParserTerm, ParserTerm)
-  Let(ParserAtom, ParserTerm, ParserTerm)
+  Letexpr(ParserAtom, ParserTerm, ParserTerm)
   Rec(ParserAtom, ParserTerm)
   Unit
   Deref(ParserTerm)
   Ref(ParserTerm)
   Assign(ParserTerm, ParserTerm)
+  Fork(expr1: ParserTerm, expr2: ParserTerm)
+  Chan
+  Send(chan: ParserTerm, content: ParserTerm)
+  Recv(chan: ParserTerm)
+  Str(content: ParserAtom)
+  Print(expr: ParserTerm)
+  Println(expr: ParserTerm)
+
+  Object(fields: List(ParserField))
+  Call(expr: ParserTerm, name: ParserAtom)
 }
 
 pub type ParserError
@@ -40,7 +60,10 @@ pub fn tokenise(term: charlist.Charlist) -> #(Success, List(Tokens), LexerError)
 pub fn parse(tokens: List(Tokens)) -> Result(ParserTerm, ParserError)
 
 fn atom_to_string(atom: ParserAtom) -> String {
-  echo atom
+  atom.content
+}
+
+fn atom_to_integer(atom: ParserInteger) -> Int {
   atom.content
 }
 
@@ -56,11 +79,16 @@ pub fn parser_to_pterm(parser_term: ParserTerm) -> term.Pterm {
       let new_pt2 = parser_to_pterm(pt2)
       term.App(new_pt1, new_pt2)
     }
-    Integer(n) -> term.Integer(n)
+    Int(pinteger) -> atom_to_integer(pinteger) |> term.Integer
     Add(pt1, pt2) -> {
       let new_pt1 = parser_to_pterm(pt1)
       let new_pt2 = parser_to_pterm(pt2)
       term.Add(new_pt1, new_pt2)
+    }
+    Sub(pt1, pt2) -> {
+      let new_pt1 = parser_to_pterm(pt1)
+      let new_pt2 = parser_to_pterm(pt2)
+      term.Sub(new_pt1, new_pt2)
     }
     Empty -> term.Empty
     Head(pt) -> parser_to_pterm(pt) |> term.Head
@@ -82,7 +110,7 @@ pub fn parser_to_pterm(parser_term: ParserTerm) -> term.Pterm {
       let new_pt3 = parser_to_pterm(pt3)
       term.Ife(new_pt1, new_pt2, new_pt3)
     }
-    Let(atom1, pt1, pt2) -> {
+    Letexpr(atom1, pt1, pt2) -> {
       let name = atom_to_string(atom1)
       let new_pt1 = parser_to_pterm(pt1)
       let new_pt2 = parser_to_pterm(pt2)
@@ -101,5 +129,28 @@ pub fn parser_to_pterm(parser_term: ParserTerm) -> term.Pterm {
       let new_pt2 = parser_to_pterm(pt2)
       term.Assign(new_pt1, new_pt2)
     }
+    Str(content) -> atom_to_string(content) |> term.Str
+    Chan -> term.Chan
+    Fork(pt1, pt2) -> {
+      let new_pt1 = parser_to_pterm(pt1)
+      let new_pt2 = parser_to_pterm(pt2)
+      term.Fork(new_pt1, new_pt2)
+    }
+    Send(pt1, pt2) -> {
+      let new_pt1 = parser_to_pterm(pt1)
+      let new_pt2 = parser_to_pterm(pt2)
+      term.Send(new_pt1, new_pt2)
+    }
+    Recv(pt) -> parser_to_pterm(pt) |> term.Recv
+    Print(pt) -> parser_to_pterm(pt) |> term.Print
+    Println(pt) -> parser_to_pterm(pt) |> term.Println
+    Call(pt, atom1) -> {
+      term.Call(parser_to_pterm(pt), atom_to_string(atom1))
+    }
+    Object(fields) ->
+      list.map(fields, fn(field) {
+        term.Field(atom_to_string(field.name), parser_to_pterm(field.body))
+      })
+      |> term.Object
   }
 }

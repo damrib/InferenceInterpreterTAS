@@ -1,27 +1,18 @@
 import alpha
 import bitable
 import gleam/dict
-import gleam/int
 import gleam/list
+import gleam/order
 import gleam/result
 import gleam/string
-import term.{
-  type Pterm, Abs, Add, App, Assign, Chan, Cons, Deref, Empty, Fork, Head, Ife,
-  Ifz, Integer, Let, Print, Println, Rec, Recv, Ref, Send, Str, Tail, Unit, Var,
+import ptype.{
+  type Ptype, type Tfield, Polymorphic, Tapp, Tchan, Tfield, Tinteger, Tlist,
+  Tobject, Tref, Tstr, Tunit, Tvar, Weak,
 }
-
-pub type Ptype {
-  Tvar(ty: String)
-  Tapp(ty1: Ptype, ty2: Ptype)
-  Tlist(ty: Ptype)
-  Tinteger
-  Tstr
-  Tunit
-  Tref(ty: Ptype)
-  Tchan(ty: Ptype)
-  Weak(ty: String)
-  // only used during the unification
-  Polymorphic(ty: Ptype)
+import term.{
+  type Pterm, Abs, Add, App, Assign, Call, Chan, Cons, Deref, Empty, Fork, Head,
+  Ife, Ifz, Integer, Let, Object, Print, Println, Rec, Recv, Ref, Send, Str, Sub,
+  Tail, Unit, Var,
 }
 
 // rule for equation generation TypingEnv |- Pterm : Ptype
@@ -35,9 +26,13 @@ pub type InferrenceError {
   GoalContradiction(msg: String, rule: Equation)
 }
 
+/// The environment storing the types of the variables that are not weak types
 pub type TypingEnv =
   dict.Dict(String, Ptype)
 
+/// The weak table stores the type of the types declared as weak (For instance we may have : '_v0 associated to Tinteger)
+/// It is possible to find the weak types associated to a type 
+/// (For instance, if '_v0 = Tinteger and 'v1 = Tinteger, then it possible to call get_keys(Tinteger) to get ['_v0, '_v1'])
 pub type WeakTable =
   bitable.Bitable(String, Ptype)
 
@@ -47,83 +42,11 @@ type Equation =
 pub type Equations =
   List(Equation)
 
-pub fn type_equality(ty1: Ptype, ty2: Ptype) -> Bool {
-  case ty1, ty2 {
-    Tvar(_), _ -> True
-    _, Tvar(_) -> True
-    Tapp(ta1, ta2), Tapp(ta3, ta4) ->
-      type_equality(ta1, ta3) || type_equality(ta2, ta4)
-    Tlist(tl1), Tlist(tl2) -> type_equality(tl1, tl2)
-    _, _ -> ty1 == ty2
-  }
-}
+/// type of the counter used in the program
+type CounterActor =
+  alpha.AlphaActor
 
-/// this function is used to display prettier type names and to avoid confusing
-/// ('_v2 -> '_v2) ref with '_v2 -> ('_v2 ref)
-fn string_of_type_aux(ptype: Ptype) -> String {
-  case ptype {
-    Tapp(ty1, ty2) -> {
-      let string_type1 = string_of_type_aux(ty1)
-      let string_type2 = string_of_type_aux(ty2)
-      string.concat(["(", string_type1, " -> ", string_type2, ")"])
-    }
-    _ -> string_of_type(ptype)
-  }
-}
-
-pub fn string_of_type(ptype: Ptype) -> String {
-  case ptype {
-    Tvar(ty) -> ty
-    Tapp(ty1, ty2) -> {
-      let string_type1 = string_of_type_aux(ty1)
-      let string_type2 = string_of_type_aux(ty2)
-      string.concat([string_type1, " -> ", string_type2])
-    }
-    Tref(ty) -> string.append(string_of_type_aux(ty), " ref")
-    Tlist(ty) -> string.append(string_of_type(ty), " list")
-    Tchan(ty) -> string.append(string_of_type(ty), " chan")
-    Tunit -> "unit"
-    Tinteger -> "int"
-    Tstr -> "str"
-    Weak(ty) -> string.append("'_", ty)
-    Polymorphic(ty) -> string.append("'", string_of_type(ty))
-  }
-}
-
-pub fn pretty_rename(ty: Ptype) -> Ptype {
-  let utf_code = fn(a) {
-    let assert Ok(utf) = string.utf_codepoint(a)
-    string.from_utf_codepoints([utf])
-  }
-
-  rename_type(ty, utf_code, 97).0
-}
-
-pub fn poly_rename(ty: Ptype, counter: CounterActor) -> Ptype {
-  let count = alpha.get_count(counter)
-  let #(new_type, add_counter) =
-    rename_type(
-      ty,
-      fn(i) { string.append("v", int.to_string(i + count)) },
-      count,
-    )
-  alpha.add_count(counter, add_counter)
-  new_type
-}
-
-pub fn rename_type(
-  ty: Ptype,
-  code: fn(Int) -> String,
-  start: Int,
-) -> #(Ptype, Int) {
-  let type_names = list.unique(enumerate_type_name(ty, []))
-  let length = list.length(type_names)
-
-  let new_names = list.map(list.range(start, start + length), code)
-  let d = dict.from_list(list.zip(type_names, new_names))
-  #(change_var_name(ty, d), start + length)
-}
-
+/// getting the type associated to the name var in the environment
 fn get_type(env: TypingEnv, var: String) -> Result(Ptype, Nil) {
   case dict.get(env, var) {
     Ok(ty) -> Ok(ty)
@@ -131,44 +54,137 @@ fn get_type(env: TypingEnv, var: String) -> Result(Ptype, Nil) {
   }
 }
 
-fn propagate_weak(
-  env: TypingEnv,
-  weaks: WeakTable,
-  ty: Ptype,
-) -> #(TypingEnv, WeakTable, Ptype) {
+/// replaces the inner types Tvar(name) by Weak(name) and adds the weak type in the weakTable
+/// For instance : type a -> b becomes '_a -> '_b
+fn propagate_weak(weaks: WeakTable, ty: Ptype) -> #(WeakTable, Ptype) {
   case ty {
     Tvar(name) -> {
-      // TODO : delete weaks from env
       let new_weaks = bitable.insert_key(weaks, name, Weak(name))
-      #(env, new_weaks, Weak(name))
+      #(new_weaks, Weak(name))
     }
     Tlist(t1) -> {
-      let #(new_env, new_weaks, new_ty) = propagate_weak(env, weaks, t1)
-      #(new_env, new_weaks, Tlist(new_ty))
+      let #(new_weaks, new_ty) = propagate_weak(weaks, t1)
+      #(new_weaks, Tlist(new_ty))
     }
     Tref(t1) -> {
-      let #(new_env, new_weaks, new_ty) = propagate_weak(env, weaks, t1)
-      #(new_env, new_weaks, Tref(new_ty))
+      let #(new_weaks, new_ty) = propagate_weak(weaks, t1)
+      #(new_weaks, Tref(new_ty))
     }
     Tchan(t1) -> {
-      let #(new_env, new_weaks, new_ty) = propagate_weak(env, weaks, t1)
-      #(new_env, new_weaks, Tchan(new_ty))
+      let #(new_weaks, new_ty) = propagate_weak(weaks, t1)
+      #(new_weaks, Tchan(new_ty))
     }
     Tapp(t1, t2) -> {
-      let #(new_env, new_weaks, new_t1) = propagate_weak(env, weaks, t1)
-      let #(new_env, new_weaks, new_t2) = propagate_weak(new_env, new_weaks, t2)
-      #(new_env, new_weaks, Tapp(new_t1, new_t2))
+      let #(new_weaks, new_t1) = propagate_weak(weaks, t1)
+      let #(new_weaks, new_t2) = propagate_weak(new_weaks, t2)
+      #(new_weaks, Tapp(new_t1, new_t2))
     }
-    Weak(_) -> #(env, weaks, ty)
     Polymorphic(_) -> panic as "should not happen"
-    _ -> #(env, weaks, ty)
+    _ -> #(weaks, ty)
   }
 }
 
+/// Add a non polymorphic type to the typing environment
 fn add_atomic(env: TypingEnv, name: String, ty: Ptype) -> TypingEnv {
   dict.insert(env, name, ty)
 }
 
+/// Checks if a term is partial application
+/// We need the typing environment to know the types of term such as Var("x")
+fn is_partial_application(term: Pterm, env: TypingEnv) -> Bool {
+  case term {
+    App(fun, _) -> {
+      // if the depth is superior to 0, then it means we define more formal argument than applied argument
+      term_depth(fun, env, dict.new(), 0) > 0
+    }
+    _ -> False
+  }
+}
+
+/// Returns the number of arrows in a type
+fn type_depth(ty: Ptype) -> Int {
+  case ty {
+    Tapp(_, t) | Polymorphic(Tapp(_, t)) -> 1 + type_depth(t)
+    _ -> 0
+  }
+}
+
+/// term_depth returns the number of arguments in a term
+fn term_depth(
+  term: Pterm,
+  type_env: TypingEnv,
+  depth_env: dict.Dict(String, Int),
+  cpt: Int,
+) -> Int {
+  case term {
+    Var(name) -> {
+      case dict.get(depth_env, name) {
+        Ok(depth) -> depth + cpt
+        // If a variable is free in the current term
+        // Then we have its type in the typing evironment
+        // We use this information instead to compute the depth
+        _ -> {
+          let assert Ok(ty) = dict.get(type_env, name)
+          type_depth(ty) + cpt
+        }
+      }
+    }
+    // It is possible to define new 
+    Let(name, bind, expr) -> {
+      let new_env =
+        dict.insert(depth_env, name, term_depth(bind, type_env, depth_env, 0))
+      term_depth(expr, type_env, new_env, cpt)
+    }
+    Abs(name, fun) -> {
+      let new_env = dict.insert(depth_env, name, 0)
+      term_depth(fun, type_env, new_env, cpt + 1)
+    }
+    App(fun, _) -> term_depth(fun, type_env, depth_env, cpt - 1)
+    Head(expr) -> term_depth(expr, type_env, depth_env, cpt)
+    Cons(expr, _) -> term_depth(expr, type_env, depth_env, cpt)
+    Deref(expr) -> term_depth(expr, type_env, depth_env, cpt)
+    // In Ifz(cond, then, els) -> the term depth of then and els is the same otherwise the inference would not be successful
+    Ifz(_, then, _) -> term_depth(then, type_env, depth_env, cpt)
+    Ife(_, then, _) -> term_depth(then, type_env, depth_env, cpt)
+    Rec(name, fun) -> {
+      let new_env = dict.insert(depth_env, name, 0)
+      term_depth(fun, type_env, new_env, cpt)
+    }
+    _ -> cpt
+  }
+}
+
+// si on déclare qu'un terme est expansif, alors on va appliquer du polymorphisme faible
+// si on a déclarer du polymorphisme faible pour un term non expansif, il n'y aura pas de changement
+// lors de l'unification
+pub fn is_expansive(term: Pterm, env: TypingEnv) -> Bool {
+  case term {
+    App(t1, t2) ->
+      // we define partial apps as expasive see partial_app_expansive in tas_test.gleam
+      is_partial_application(term, env)
+      || is_expansive(t1, env)
+      || is_expansive(t2, env)
+    Let(_, _, expr) -> is_expansive(expr, env)
+    // if then is expansive but els is not typing should probably not work
+    Ife(_, then, els) -> is_expansive(then, env) || is_expansive(els, env)
+    Ifz(_, then, els) -> is_expansive(then, env) || is_expansive(els, env)
+    Ref(_) -> True
+    // The type of chan is fixed after its first use
+    Chan -> True
+    // Recv causes side effects and has a value other than unit
+    Recv(_) -> True
+    // Send causes side effects and has a value other than unit
+    Send(_, _) -> True
+    _ -> False
+  }
+}
+
+/// This function modifies the typing environment and the weak variable tables.
+/// If term is expansive then all the inner types of the type var are added to the weak table.
+/// If the term is not expansive and is not an Object, we add a polymorphic type to the environment.
+/// If the term is not expansive and is Object, we check if the fields are expansive 
+/// and update the environement or the weak tble accordingly.
+/// This function is used when generating the equations of a let term.
 fn add_polymorphic(
   env: TypingEnv,
   weaks: WeakTable,
@@ -176,24 +192,55 @@ fn add_polymorphic(
   term: Pterm,
   var: Ptype,
 ) -> #(TypingEnv, WeakTable) {
-  case term.is_expansive(term) {
+  case is_expansive(term, env) {
     True -> {
-      let #(new_env, new_weaks, new_ty) = propagate_weak(env, weaks, var)
-      #(dict.insert(new_env, name, new_ty), new_weaks)
+      let #(new_weaks, new_ty) = propagate_weak(weaks, var)
+      #(dict.insert(env, name, new_ty), new_weaks)
     }
-    False -> #(dict.insert(env, name, Polymorphic(var)), weaks)
+    False -> {
+      case term, var {
+        Object(fields), Tobject(types) -> {
+          let res_type =
+            list.fold(types, #(weaks, []), fn(acc, field_ty) {
+              let assert Ok(field) =
+                list.find(fields, fn(field) { field.name == field_ty.name })
+
+              case is_expansive(field.body, env) {
+                True -> {
+                  let #(new_acc, new_ty) = propagate_weak(acc.0, field_ty.ty)
+                  #(new_acc, [Tfield(field_ty.name, new_ty), ..acc.1])
+                }
+                False -> #(acc.0, [
+                  Tfield(field_ty.name, Polymorphic(field_ty.ty)),
+                  ..acc.1
+                ])
+              }
+            })
+          #(
+            dict.insert(env, name, ptype.new_object_type(res_type.1)),
+            res_type.0,
+          )
+        }
+        _, _ -> #(dict.insert(env, name, Polymorphic(var)), weaks)
+      }
+    }
   }
 }
 
+/// function to check whether a type is part of the inner types of another type
 fn in_type(var: String, ty: Ptype) -> Bool {
   case ty {
     Tvar(v) if v == var -> True
     Tapp(ty1, ty2) -> in_type(var, ty1) || in_type(var, ty2)
-    Tlist(ty) | Tref(ty) -> in_type(var, ty)
+    Tlist(ty) | Tref(ty) | Tchan(ty) -> in_type(var, ty)
+    Tobject(fields_ty) -> {
+      list.any(fields_ty, fn(field) { in_type(var, field.ty) })
+    }
     _ -> False
   }
 }
 
+/// During the unification process, we replace the inner types Tvar(var) by new_ty
 fn substitute_type(
   weaks: WeakTable,
   ty: Ptype,
@@ -213,20 +260,41 @@ fn substitute_type(
     Weak(name) -> {
       case bitable.get_value(weaks, name) {
         Ok(res) -> res
-        // TODO
-        Error(_) -> ty
+        Error(_) -> panic as "should not happen"
       }
+    }
+    Tobject(types) -> {
+      list.map(types, fn(field) {
+        Tfield(field.name, substitute_type(weaks, field.ty, var, new_ty))
+      })
+      |> ptype.new_object_type
     }
     _ -> ty
   }
 }
 
+/// During the unification process, we replace the inner types Tvar(var) by new_ty in all equations passed in argument
 fn substitute_type_equations(
   weaks: WeakTable,
   equations: Equations,
   var: String,
-  new_type: Ptype,
+  ty: Ptype,
 ) -> Equations {
+  let new_type = case ty {
+    Tobject(methods_type) -> {
+      list.fold(equations, methods_type, fn(acc, eq) {
+        case eq {
+          #(Tvar(name), Tobject(mtypes)) if name == var -> {
+            list.append(mtypes, acc)
+          }
+          _ -> acc
+        }
+      })
+      |> list.unique
+      |> ptype.new_object_type
+    }
+    _ -> ty
+  }
   fn(eq: #(Ptype, Ptype)) -> Equation {
     let new_ty1 = substitute_type(weaks, eq.0, var, new_type)
     let new_ty2 = substitute_type(weaks, eq.1, var, new_type)
@@ -235,36 +303,14 @@ fn substitute_type_equations(
   |> list.map(equations, _)
 }
 
-fn generate_list_equations(
-  acc: List(#(Pterm, Ptype, TypingEnv)),
-  list: Pterm,
-  elem_type: Ptype,
-  env: TypingEnv,
-) -> List(#(Pterm, Ptype, TypingEnv)) {
-  case list {
-    Cons(elem, rest) ->
-      generate_list_equations(
-        [#(elem, elem_type, env), ..acc],
-        rest,
-        elem_type,
-        env,
-      )
-    Deref(Var(_)) -> [#(list, Tlist(elem_type), env), ..acc]
-    Empty -> acc
-    _ ->
-      panic as string.append(
-          "generate_list_equations should only be used on Cons and Empty : ",
-          term.string_of_term(list, 0),
-        )
-  }
-}
-
+/// If the type ty has inner weak types then replace the inner types by their weak types
+/// Or simply return ty
 fn weak_type_or(weaks: WeakTable, ty: Ptype) -> Ptype {
   case ty {
     Weak(name) -> {
       case bitable.get_value(weaks, name) {
         Ok(res) -> res
-        Error(_) -> ty
+        Error(_) -> panic as "should not happen"
       }
     }
     Tapp(t1, t2) -> {
@@ -275,130 +321,191 @@ fn weak_type_or(weaks: WeakTable, ty: Ptype) -> Ptype {
     Tchan(t1) -> weak_type_or(weaks, t1) |> Tchan
     Tlist(t1) -> weak_type_or(weaks, t1) |> Tlist
     Tref(t1) -> weak_type_or(weaks, t1) |> Tref
+    Tobject(method_types) -> {
+      list.map(method_types, fn(field) {
+        Tfield(field.name, weak_type_or(weaks, field.ty))
+      })
+      |> ptype.new_object_type
+    }
     _ -> ty
   }
 }
 
-/// auxiliary function of generate_equations used to do tail recursive
-fn generate_equations_auxiliary(
+fn generate_list_rules(
+  acc: List(Rule),
+  list: Pterm,
+  elem_type: Ptype,
+  env: TypingEnv,
+) -> List(Rule) {
+  case list {
+    Cons(elem, rest) ->
+      generate_list_rules(
+        [#(elem, elem_type, env), ..acc],
+        rest,
+        elem_type,
+        env,
+      )
+    Deref(_) | Recv(_) | App(_, _) | Call(_, _) -> [
+      #(list, Tlist(elem_type), env),
+      ..acc
+    ]
+    Empty -> acc
+    _ ->
+      panic as string.append(
+          "generated_list_rules should only be used on Cons and Empty : ",
+          term.string_of_term(list, 0),
+        )
+  }
+}
+
+fn generate_object_type(
+  fields: List(term.Field),
+  counter: CounterActor,
+) -> List(Tfield) {
+  let tfields = {
+    use acc, term.Field(name, _) <- list.fold(fields, [])
+    let new_type = alpha.new_var(counter) |> Tvar
+    [Tfield(name, new_type), ..acc]
+  }
+  // we reverse the list so that it is in the same order as fields
+  list.reverse(tfields)
+}
+
+fn generate_object_rules(
+  acc: List(Rule),
+  fields: List(term.Field),
+  tfields: List(Tfield),
+  env: TypingEnv,
+) -> List(Rule) {
+  case fields, tfields {
+    [], [] -> acc
+    [], _ | _, [] -> panic as "should not happen"
+    [field, ..rest_fields], [tfield, ..rest_tfields] -> {
+      let new_rule = #(field.body, tfield.ty, env)
+      generate_object_rules([new_rule, ..acc], rest_fields, rest_tfields, env)
+    }
+  }
+}
+
+fn generate_equations(
   acc: Equations,
-  remaining: List(Rule),
+  rule: Rule,
   counter: CounterActor,
   weaks: WeakTable,
 ) -> Result(#(Equations, WeakTable), InferrenceError) {
-  case remaining {
-    [] -> Ok(#(acc, weaks))
-    [#(Var(v), ty, env), ..rest] -> {
+  case rule {
+    #(Var(v), ty, env) -> {
       let assert Ok(var_type) = get_type(env, v)
         as "a variable has not been typed"
       let new_equation = #(weak_type_or(weaks, var_type), ty)
-
-      generate_equations_auxiliary([new_equation, ..acc], rest, counter, weaks)
+      Ok(#([new_equation, ..acc], weaks))
     }
-    [#(App(term1, term2), ty, env), ..rest] -> {
+    #(App(term1, term2), ty, env) -> {
       let new_type = alpha.new_var(counter)
-      let new_eq1 = #(term1, Tapp(Tvar(new_type), ty), env)
-      let new_eq2 = #(term2, Tvar(new_type), env)
-      generate_equations_auxiliary(
+      let new_rule1 = #(term1, Tapp(Tvar(new_type), ty), env)
+      let new_rule2 = #(term2, Tvar(new_type), env)
+      use #(new_acc, new_weaks) <- result.try(generate_equations(
         acc,
-        [new_eq2, new_eq1, ..rest],
+        new_rule2,
         counter,
         weaks,
-      )
+      ))
+      generate_equations(new_acc, new_rule1, counter, new_weaks)
     }
-    [#(Abs(x, term), ty, env), ..rest] -> {
-      let new_type1 = alpha.new_var(counter)
-      let new_type2 = alpha.new_var(counter)
-      let new_equation = #(ty, Tapp(Tvar(new_type1), Tvar(new_type2)))
-      let new_env = add_atomic(env, x, Tvar(new_type1))
-      generate_equations_auxiliary(
+    #(Abs(x, term), ty, env) -> {
+      let new_type1 = alpha.new_var(counter) |> Tvar
+      let new_type2 = alpha.new_var(counter) |> Tvar
+      let new_equation = #(ty, Tapp(new_type1, new_type2))
+      let new_env = add_atomic(env, x, new_type1)
+      let new_rule = #(term, new_type2, new_env)
+      generate_equations([new_equation, ..acc], new_rule, counter, weaks)
+    }
+    #(Integer(_), ty, _) -> Ok(#([#(Tinteger, ty), ..acc], weaks))
+    #(Add(t1, t2), ty, env) | #(Sub(t1, t2), ty, env) -> {
+      let new_rule1 = #(t1, Tinteger, env)
+      let new_rule2 = #(t2, Tinteger, env)
+      let new_equation = #(Tinteger, ty)
+      use #(new_acc, new_weaks) <- result.try(generate_equations(
         [new_equation, ..acc],
-        [#(term, Tvar(new_type2), new_env), ..rest],
+        new_rule2,
         counter,
         weaks,
-      )
+      ))
+      generate_equations(new_acc, new_rule1, counter, new_weaks)
     }
-    [#(Integer(_), ty, _), ..rest] -> {
-      generate_equations_auxiliary(
-        [#(Tinteger, ty), ..acc],
-        rest,
-        counter,
+    #(Cons(_, _) as l, ty, env) -> {
+      let new_type = alpha.new_var(counter) |> Tvar
+      let new_equation = #(ty, Tlist(new_type))
+      let new_rules = generate_list_rules([], l, new_type, env)
+      use #(new_acc, new_weaks), rule <- list.try_fold(new_rules, #(
+        [new_equation, ..acc],
         weaks,
-      )
+      ))
+      generate_equations(new_acc, rule, counter, new_weaks)
     }
-    [#(Add(t1, t2), ty, env), ..rest] -> {
-      let new_eq1 = #(t1, Tinteger, env)
-      let new_eq2 = #(t2, Tinteger, env)
-      generate_equations_auxiliary(
-        [#(Tinteger, ty), ..acc],
-        [new_eq2, new_eq1, ..rest],
-        counter,
-        weaks,
-      )
-    }
-    [#(Cons(_, _) as l, ty, env), ..rest] -> {
-      let type_name = alpha.new_var(counter)
-      let new_type = Tvar(type_name)
-      let remaining_eqs = generate_list_equations(rest, l, new_type, env)
-      generate_equations_auxiliary(
-        [#(ty, Tlist(new_type)), ..acc],
-        remaining_eqs,
-        counter,
-        weaks,
-      )
-    }
-    [#(Head(l), ty, env), ..rest] -> {
+    #(Head(l), ty, env) -> {
       //   env |- l : Tlist(t) 
       // ---------------------- 
       //   env |- Head(l) : t 
-      generate_equations_auxiliary(
-        acc,
-        [#(l, Tlist(ty), env), ..rest],
-        counter,
-        weaks,
-      )
+      let new_rule = #(l, Tlist(ty), env)
+      generate_equations(acc, new_rule, counter, weaks)
     }
-    [#(Tail(l), ty, env), ..rest] -> {
+    #(Tail(l), ty, env) -> {
       //    env |- l : t 
       // -------------------- 
       //  env |- Tail(l) : t
-      generate_equations_auxiliary(acc, [#(l, ty, env), ..rest], counter, weaks)
+      let new_rule = #(l, ty, env)
+      generate_equations(acc, new_rule, counter, weaks)
     }
-    [#(Empty, ty, _), ..rest] -> {
-      let type_name = alpha.new_var(counter)
-      let new_type = Tvar(type_name)
-      generate_equations_auxiliary(
-        [#(Tlist(new_type), ty), ..acc],
-        rest,
-        counter,
-        weaks,
-      )
+    #(Empty, ty, _) -> {
+      let new_type = alpha.new_var(counter) |> Tvar |> Tlist
+      let new_equation = #(new_type, ty)
+      Ok(#([new_equation, ..acc], weaks))
     }
-    [#(Ife(c, t, e), ty, env), ..rest] -> {
+    #(Ife(c, t, e), ty, env) -> {
       // env |- c : t0 list env |- t : t1 env |- e : t1
       // -----------------------------------------------
       //               Ife(c, t, e) : t1
-      let type_name = alpha.new_var(counter)
-      let new_type = Tlist(Tvar(type_name))
-      generate_equations_auxiliary(
+      let new_type = alpha.new_var(counter) |> Tvar |> Tlist
+      let new_rule_c = #(c, new_type, env)
+      let new_rule_t = #(t, ty, env)
+      let new_rule_e = #(e, ty, env)
+      use #(new_acc, new_weaks) <- result.try(generate_equations(
         acc,
-        [#(c, new_type, env), #(t, ty, env), #(e, ty, env), ..rest],
+        new_rule_e,
         counter,
         weaks,
-      )
+      ))
+      use #(new_acc, new_weaks) <- result.try(generate_equations(
+        new_acc,
+        new_rule_t,
+        counter,
+        new_weaks,
+      ))
+      generate_equations(new_acc, new_rule_c, counter, new_weaks)
     }
-    [#(Ifz(c, t, e), ty, env), ..rest] -> {
-      // env |- c : int env |- t : t1 env |- e : t1
+    #(Ifz(c, t, e), ty, env) -> {
+      // env |- c : t0 list env |- t : t1 env |- e : t1
       // -----------------------------------------------
       //               Ife(c, t, e) : t1
-      generate_equations_auxiliary(
+      let new_rule_c = #(c, Tinteger, env)
+      let new_rule_t = #(t, ty, env)
+      let new_rule_e = #(e, ty, env)
+      use #(new_acc, new_weaks) <- result.try(generate_equations(
         acc,
-        [#(c, Tinteger, env), #(t, ty, env), #(e, ty, env), ..rest],
+        new_rule_e,
         counter,
         weaks,
-      )
+      ))
+      use #(new_acc, new_weaks) <- result.try(generate_equations(
+        new_acc,
+        new_rule_t,
+        counter,
+        new_weaks,
+      ))
+      generate_equations(new_acc, new_rule_c, counter, new_weaks)
     }
-    [#(Let(var, bind, e), ty, env), ..rest] -> {
+    #(Let(var, bind, e), ty, env) -> {
       //  env |- bind : new_type  (var, new_type).env |- e : ty 
       // --------------------------------------------------------- 
       //          env |- let var = bind in e : ty
@@ -410,107 +517,80 @@ fn generate_equations_auxiliary(
       ))
       let #(new_env, new_weaks) =
         add_polymorphic(env, new_weaks, var, bind, new_type)
-      generate_equations_auxiliary(
-        acc,
-        [#(e, ty, new_env), ..rest],
-        counter,
-        new_weaks,
-      )
+      let new_rule = #(e, ty, new_env)
+      generate_equations(acc, new_rule, counter, new_weaks)
     }
-    [#(Rec(name, fun), ty, env), ..rest] -> {
+    #(Rec(name, fun), ty, env) -> {
       let new_env = add_atomic(env, name, ty)
-      generate_equations_auxiliary(
-        acc,
-        [#(fun, ty, new_env), ..rest],
-        counter,
-        weaks,
-      )
+      let new_rule = #(fun, ty, new_env)
+      generate_equations(acc, new_rule, counter, weaks)
     }
-    [#(Unit, ty, _), ..rest] ->
-      generate_equations_auxiliary([#(Tunit, ty), ..acc], rest, counter, weaks)
-    [#(Ref(t), ty, env), ..rest] -> {
+    #(Unit, ty, _) -> Ok(#([#(Tunit, ty), ..acc], weaks))
+    #(Ref(t), ty, env) -> {
       //   env |- t : new_type
       // --------------------------------
       //   env |- ref t : new_type ref
       // new_equation : ty = new_type ref
-      let new_var = alpha.new_var(counter)
-      let new_type = Tvar(new_var)
-      generate_equations_auxiliary(
-        [#(Tref(new_type), ty), ..acc],
-        [#(t, new_type, env), ..rest],
-        counter,
-        weaks,
-      )
+      let new_type = alpha.new_var(counter) |> Tvar
+      let new_equation = #(Tref(new_type), ty)
+      let new_rule = #(t, new_type, env)
+      generate_equations([new_equation, ..acc], new_rule, counter, weaks)
     }
-    [#(Deref(t), ty, env), ..rest] -> {
+    #(Deref(t), ty, env) -> {
       //  env |- t : ty ref
       // --------------------
       //  env |- !t : ty
-      generate_equations_auxiliary(
-        acc,
-        [#(t, Tref(ty), env), ..rest],
-        counter,
-        weaks,
-      )
+      let new_rule = #(t, Tref(ty), env)
+      generate_equations(acc, new_rule, counter, weaks)
     }
-    [#(Assign(ref, t), ty, env), ..rest] -> {
+    #(Assign(ref, t), ty, env) -> {
       //  env |- ref : new_type ref  env |- t : new_type
       // -------------------------------------------------
       //       env |- ref := t : Tunit
       // new_equation : ty = Tunit
-      let new_var = alpha.new_var(counter)
-      let new_type = Tvar(new_var)
-      generate_equations_auxiliary(
-        [#(Tunit, ty), ..acc],
-        [#(ref, Tref(new_type), env), #(t, new_type, env), ..rest],
+      let new_type = alpha.new_var(counter) |> Tvar
+      let new_equation = #(Tunit, ty)
+      let new_rule_ref = #(ref, Tref(new_type), env)
+      let new_rule_t = #(t, new_type, env)
+      use #(new_acc, new_weaks) <- result.try(generate_equations(
+        [new_equation, ..acc],
+        new_rule_t,
         counter,
         weaks,
-      )
+      ))
+      generate_equations(new_acc, new_rule_ref, counter, new_weaks)
     }
-    [#(Chan, ty, _), ..rest] -> {
+    #(Chan, ty, _) -> {
       //       
       // ----------------------------------
       //       env |- chan : ty
-      // new equation : ty = new_type chan
-      let new_var = alpha.new_var(counter)
-      let new_type = Tchan(Tvar(new_var))
-      generate_equations_auxiliary(
-        [#(ty, new_type), ..acc],
-        rest,
-        counter,
-        weaks,
-      )
+      // new equation : ty = new_type chan     
+      let new_type = alpha.new_var(counter) |> Tvar |> Tchan
+      let new_equation = #(ty, new_type)
+      Ok(#([new_equation, ..acc], weaks))
     }
-    [#(Send(chan, message), ty, env), ..rest] -> {
+    #(Send(chan, message), ty, env) -> {
       //      env |- channel : ty chan         env |- message : ty
       // ---------------------------------------------------------
       //       env |- Send(channel, message) : ty
-      // TODO: ajout weak pour chan? Care bug env diff left right
       use #(new_weaks, new_ty) <- result.try(inference_auxiliary(
         message,
         env,
         counter,
         weaks,
       ))
-      generate_equations_auxiliary(
-        [#(new_ty, ty), ..acc],
-        [#(chan, Tchan(new_ty), env), ..rest],
-        counter,
-        new_weaks,
-      )
+      let new_equation = #(new_ty, ty)
+      let new_rule = #(chan, Tchan(new_ty), env)
+      generate_equations([new_equation, ..acc], new_rule, counter, new_weaks)
     }
-    [#(Recv(chan), ty, env), ..rest] -> {
+    #(Recv(chan), ty, env) -> {
       //      env |- channel : ty chan
       // ------------------------------------
       //      env |- Recv(channel) : ty
-      generate_equations_auxiliary(
-        acc,
-        [#(chan, Tchan(ty), env), ..rest],
-        counter,
-        weaks,
-      )
+      let new_rule = #(chan, Tchan(ty), env)
+      generate_equations(acc, new_rule, counter, weaks)
     }
-    [#(Fork(expr1, expr2), ty, env), ..rest] -> {
+    #(Fork(expr1, expr2), ty, env) -> {
       use #(new_weaks, _) <- result.try(inference_auxiliary(
         expr1,
         env,
@@ -523,22 +603,32 @@ fn generate_equations_auxiliary(
         counter,
         new_weaks,
       ))
-      generate_equations_auxiliary(
-        [#(ty, Tunit), ..acc],
-        rest,
-        counter,
-        new_weaks,
-      )
+      let new_equation = #(ty, Tunit)
+      Ok(#([new_equation, ..acc], new_weaks))
     }
-    [#(Str(_), ty, _), ..rest] ->
-      generate_equations_auxiliary([#(ty, Tstr), ..acc], rest, counter, weaks)
-    [#(Print(t), ty, env), ..rest] | [#(Println(t), ty, env), ..rest] -> {
-      generate_equations_auxiliary(
-        [#(ty, Tunit), ..acc],
-        [#(t, Tstr, env), ..rest],
-        counter,
+    #(Str(_), ty, _) -> {
+      let new_equation = #(Tstr, ty)
+      Ok(#([new_equation, ..acc], weaks))
+    }
+    #(Print(t), ty, env) | #(Println(t), ty, env) -> {
+      let new_equation = #(ty, Tunit)
+      let new_rule = #(t, Tstr, env)
+      generate_equations([new_equation, ..acc], new_rule, counter, weaks)
+    }
+    #(Call(obj, name), ty, env) -> {
+      let new_rule = #(obj, Tobject([Tfield(name, ty)]), env)
+      generate_equations(acc, new_rule, counter, weaks)
+    }
+    #(Object(fields), ty, env) -> {
+      let tfields = generate_object_type(fields, counter)
+      let new_type = ptype.new_object_type(tfields)
+      let new_equation = #(ty, new_type)
+      let new_rules = generate_object_rules([], fields, tfields, env)
+      use #(new_acc, new_weaks), rule <- list.try_fold(new_rules, #(
+        [new_equation, ..acc],
         weaks,
-      )
+      ))
+      generate_equations(new_acc, rule, counter, new_weaks)
     }
   }
 }
@@ -547,20 +637,7 @@ const goal_string = "goal"
 
 const goal_type = Tvar(goal_string)
 
-fn generate_equations(
-  term: Pterm,
-  counter: CounterActor,
-) -> Result(Equations, InferrenceError) {
-  generate_equations_auxiliary(
-    [],
-    [#(term, goal_type, dict.new())],
-    counter,
-    bitable.new(),
-  )
-  |> result.map(fn(res) { res.0 })
-}
-
-// TODO potentiel bug
+/// Returns the final type of the goal and verify that the goal does not take multiple types
 fn get_var_type(
   equations: Equations,
   goal: String,
@@ -586,13 +663,28 @@ fn get_var_type(
   }
 }
 
-pub fn is_non_trivial(equation: Equation) -> Bool {
-  case equation {
-    #(Tinteger, Tinteger) -> False
-    _ -> True
+/// Returns the equations obtained from an equation between two object types (Ex : Tobject(types1) = Tobject(types2))
+/// Precondition : types1 and types2 are sorted according to the names of their fields 
+pub fn sub_types_equations(
+  acc_equations: Equations,
+  types1: List(Tfield),
+  types2: List(Tfield),
+) -> List(#(Ptype, Ptype)) {
+  case types1, types2 {
+    [], [] | [], _ | _, [] -> acc_equations
+    [Tfield(name1, ty1), ..rest1], [Tfield(name2, ty2), ..rest2] -> {
+      case string.compare(name1, name2) {
+        order.Eq ->
+          sub_types_equations([#(ty1, ty2), ..acc_equations], rest1, rest2)
+        order.Lt -> sub_types_equations(acc_equations, rest1, types2)
+        order.Gt -> sub_types_equations(acc_equations, types1, rest2)
+      }
+    }
   }
 }
 
+/// computes the result of the Tvar("goal") from the equations passed in argument
+/// This functions is tail recursive
 fn unification_auxiliary(
   equations: Equations,
   treated: Equations,
@@ -603,7 +695,7 @@ fn unification_auxiliary(
   case equations {
     [] -> get_var_type(treated, goal, weaks)
     [#(Polymorphic(t1), t2), ..rest] | [#(t2, Polymorphic(t1)), ..rest] -> {
-      let new_ty1 = poly_rename(t1, counter)
+      let new_ty1 = ptype.poly_rename(t1, counter)
       unification_auxiliary(
         [#(new_ty1, t2), ..rest],
         treated,
@@ -625,18 +717,19 @@ fn unification_auxiliary(
         new_weaks,
       )
     }
-    [#(Tvar(v), _) as g, ..rest] | [#(_, Tvar(v)) as g, ..rest] if v == goal ->
+    [#(Tvar(v), _) as g, ..rest] | [#(_, Tvar(v)) as g, ..rest] if v == goal -> {
       unification_auxiliary(rest, [g, ..treated], goal, counter, weaks)
+    }
     [#(Tvar(v) as t1, t2), ..rest] | [#(t2, Tvar(v) as t1), ..rest] -> {
       case in_type(v, t2) {
         False -> {
           let new_equations =
             substitute_type_equations(weaks, list.append(rest, treated), v, t2)
-          // TODO: CARE BUG Weak(t1)?
           let new_weaks = bitable.replace_value(weaks, t1, t2)
           unification_auxiliary(new_equations, [], goal, counter, new_weaks)
         }
-
+        True if t1 == t2 ->
+          unification_auxiliary(rest, treated, goal, counter, weaks)
         True ->
           Error(
             UnificationError(
@@ -647,8 +740,13 @@ fn unification_auxiliary(
       }
     }
     [#(Tapp(t1, t2), Tapp(t3, t4)), ..rest] ->
+      // We add the equations (t3, t1) instead of (t1, t3) because order matters when typing object
+      // we have :
+      //  t3 <= t1  t2 <= t4
+      // --------------------
+      // t1 -> t2 <= t3 -> t4 
       unification_auxiliary(
-        [#(t1, t3), #(t2, t4), ..rest],
+        [#(t3, t1), #(t2, t4), ..rest],
         treated,
         goal,
         counter,
@@ -687,6 +785,10 @@ fn unification_auxiliary(
         counter,
         weaks,
       )
+    [#(Tobject(types1) as t1, Tobject(types2) as t2), ..rest] -> {
+      sub_types_equations(rest, types1, types2)
+      |> unification_auxiliary([#(t1, t2), ..treated], goal, counter, weaks)
+    }
     [#(Tlist(_) as t1, t2), ..] | [#(t1, Tlist(_) as t2), ..] ->
       Error(UnificationError("cannot unify list with non list type", #(t1, t2)))
     [#(Tref(_) as t1, t2), ..] | [#(t1, Tref(_) as t2), ..] ->
@@ -695,88 +797,50 @@ fn unification_auxiliary(
       Error(
         UnificationError("cannot unify chan type with non chan type", #(t1, t2)),
       )
-    _ -> panic as "not implemented"
+    [#(Tobject(_) as t1, t2), ..] | [#(t1, Tobject(_) as t2), ..] ->
+      Error(
+        UnificationError("cannot unify object type with non object type", #(
+          t1,
+          t2,
+        )),
+      )
+    [#(Tinteger as t1, t2), ..]
+    | [#(t1, Tinteger as t2), ..]
+    | [#(Tunit as t1, t2), ..]
+    | [#(t1, Tunit as t2), ..] ->
+      Error(
+        UnificationError("cannot unify atomic type with different type", #(
+          t1,
+          t2,
+        )),
+      )
   }
 }
 
-fn unification(
-  equations: Equations,
-  counter: CounterActor,
-) -> Result(Ptype, InferrenceError) {
-  let res =
-    unification_auxiliary(equations, [], goal_string, counter, bitable.new())
-  result.map(res, fn(ok) { ok.1 })
-}
-
-type CounterActor =
-  alpha.AlphaActor
-
+/// auxiliary function of inference
 fn inference_auxiliary(
   term: Pterm,
   env: TypingEnv,
   act: CounterActor,
   weaks: WeakTable,
 ) -> Result(#(WeakTable, Ptype), InferrenceError) {
-  use #(equations, new_weaks) <- result.try(generate_equations_auxiliary(
+  use #(equations, new_weaks) <- result.try(generate_equations(
     [],
-    [#(term, goal_type, env)],
+    #(term, goal_type, env),
     act,
     weaks,
   ))
   unification_auxiliary(equations, [], goal_string, act, new_weaks)
 }
 
+/// infers the type of term t
 pub fn inference(t: Pterm) -> Result(Ptype, InferrenceError) {
   let counter = alpha.new_counter()
-  use equations <- result.try(generate_equations(t, counter))
-  unification(equations, counter)
-}
-
-fn enumerate_type_name(ty: Ptype, acc: List(String)) -> List(String) {
-  case ty {
-    Tvar(v) -> [v, ..acc]
-    Tapp(ty1, ty2) -> {
-      let acc = enumerate_type_name(ty2, acc)
-      enumerate_type_name(ty1, acc)
-    }
-    Tref(ty) -> enumerate_type_name(ty, acc)
-    Tlist(ty) -> enumerate_type_name(ty, acc)
-    Tchan(ty) -> enumerate_type_name(ty, acc)
-    Tunit -> acc
-    Tinteger -> acc
-    Tstr -> acc
-    Weak(ty) -> [ty, ..acc]
-    Polymorphic(ty) -> enumerate_type_name(ty, acc)
-  }
-}
-
-fn change_var_name(ty: Ptype, d: dict.Dict(String, String)) -> Ptype {
-  case ty {
-    Tvar(v) -> {
-      let assert Ok(new_name) = dict.get(d, v)
-      Tvar(new_name)
-    }
-    Tapp(ty1, ty2) -> {
-      let new_ty1 = change_var_name(ty1, d)
-      let new_ty2 = change_var_name(ty2, d)
-      Tapp(new_ty1, new_ty2)
-    }
-    Tchan(ty) -> {
-      let new_ty = change_var_name(ty, d)
-      Tchan(new_ty)
-    }
-    Tref(ty) -> {
-      let new_ty = change_var_name(ty, d)
-      Tref(new_ty)
-    }
-    Tlist(ty) -> {
-      let new_ty = change_var_name(ty, d)
-      Tlist(new_ty)
-    }
-    Weak(name) -> {
-      let assert Ok(new_name) = dict.get(d, name)
-      Weak(new_name)
-    }
-    t -> t
-  }
+  use #(_, res) <- result.map(inference_auxiliary(
+    t,
+    dict.new(),
+    counter,
+    bitable.new(),
+  ))
+  res
 }

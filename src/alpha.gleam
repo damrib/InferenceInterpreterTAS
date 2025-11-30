@@ -1,11 +1,12 @@
 import gleam/dict
 import gleam/erlang/process
 import gleam/int
+import gleam/list
 import gleam/otp/actor
 import gleam/string
 import term.{
-  type Pterm, Abs, Add, App, Assign, Cons, Deref, Empty, Head, Ife, Ifz, Integer,
-  Let, Rec, Ref, Tail, Unit, Var,
+  type Pterm, Abs, Add, App, Assign, Cons, Deref, Empty, Field, Head, Ife, Ifz,
+  Integer, Let, Rec, Ref, Sub, Tail, Unit, Var,
 }
 
 const actor_timeout = 100
@@ -52,6 +53,11 @@ fn alpha_conversion_auxiliary(
       let new_t1 = alpha_conversion_auxiliary(t1, name_table, counter)
       let new_t2 = alpha_conversion_auxiliary(t2, name_table, counter)
       Add(new_t1, new_t2)
+    }
+    Sub(t1, t2) -> {
+      let new_t1 = alpha_conversion_auxiliary(t1, name_table, counter)
+      let new_t2 = alpha_conversion_auxiliary(t2, name_table, counter)
+      Sub(new_t1, new_t2)
     }
     Empty -> term
     Cons(elem, rest) -> {
@@ -126,6 +132,14 @@ fn alpha_conversion_auxiliary(
       alpha_conversion_auxiliary(expr, name_table, counter) |> term.Print
     term.Println(expr) ->
       alpha_conversion_auxiliary(expr, name_table, counter) |> term.Println
+    term.Object(methods) -> {
+      list.map(methods, fn(method) {
+        alpha_conversion_auxiliary(method.body, name_table, counter)
+        |> Field(method.name, _)
+      })
+      |> term.Object
+    }
+    term.Call(_, _) -> term
   }
 }
 

@@ -8,7 +8,6 @@ import term
 
 pub opaque type MemoryError {
   MemoryAccess(msg: String)
-  ChannelCommunication(msg: String)
   UndefinedIndirection(msg: String)
 }
 
@@ -59,6 +58,8 @@ pub type MemoryActor =
 
 pub const actor_timeout = 100
 
+pub const channel_deadlock = 10_000
+
 fn new_access_error(name: String) -> MemoryError {
   string.concat(["there is no variable with name: ", name, "in memory"])
   |> MemoryAccess
@@ -67,11 +68,6 @@ fn new_access_error(name: String) -> MemoryError {
 fn new_channel_error(name: String) -> MemoryError {
   string.concat(["there is no channel with name: ", name, "in memory"])
   |> MemoryAccess
-}
-
-fn missing_message_error(name: String) -> MemoryError {
-  string.append("No message was received on the channel: ", name)
-  |> ChannelCommunication
 }
 
 fn get_region(mem: Memory, id: String) -> Result(term.Pterm, MemoryError) {
@@ -223,7 +219,7 @@ pub fn recv_message(
   name: String,
 ) -> Result(term.Pterm, MemoryError) {
   memory.data
-  |> actor.call(actor_timeout, fn(arg) { Recv(name, arg) })
+  |> actor.call(channel_deadlock, fn(arg) { Recv(name, arg) })
 }
 
 pub fn send_message(
@@ -232,7 +228,7 @@ pub fn send_message(
   term: term.Pterm,
 ) -> Result(Nil, MemoryError) {
   memory.data
-  |> actor.call(actor_timeout, fn(arg) { Send(name, term, arg) })
+  |> actor.call(channel_deadlock, fn(arg) { Send(name, term, arg) })
 }
 
 pub fn access_mem(

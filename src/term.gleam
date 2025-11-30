@@ -1,6 +1,10 @@
-import gleam/dict
 import gleam/int
+import gleam/list
 import gleam/string
+
+pub type Field {
+  Field(name: String, body: Pterm)
+}
 
 pub type Pterm {
   // syntaxe Var("x") : "x" 
@@ -13,6 +17,8 @@ pub type Pterm {
   Integer(n: Int)
   // syntaxe Add(expr1, expr2) : expr1 + expr2
   Add(expr1: Pterm, expr2: Pterm)
+  // syntaxe Sub(expr1, expr2) : expr1 - expr2
+  Sub(expr1: Pterm, expr2: Pterm)
   // syntaxe Empty : []
   Empty
   // syntaxe Head(list) : Head(list)
@@ -21,11 +27,11 @@ pub type Pterm {
   Tail(list: Pterm)
   // syntaxe Cons(elem1, Cons(elem2, ...)) : [elem1, elem2, ...]
   Cons(elem: Pterm, rest: Pterm)
-  // syntaxe Ifz(cond, expr1, expr2) : ifz cond then expr1 else expr2
+  // syntaxe Ifz(cond, expr1, expr2) : Ifz cond Then expr1 Else expr2
   Ifz(cond: Pterm, then: Pterm, els: Pterm)
-  // syntaxe Ife(cond, expr1, expr2) : ife cond then expr1 else expr2
+  // syntaxe Ife(cond, expr1, expr2) : Ife cond Then expr1 Else expr2
   Ife(cond: Pterm, then: Pterm, els: Pterm)
-  // syntaxe Let("x", bind, expr) : Let x = bind in expr
+  // syntaxe Let("x", bind, expr) : Let x = bind In expr
   Let(var: String, bind: Pterm, expr: Pterm)
   // syntaxe Rec("x", fun) : Rec x = fun
   Rec(name: String, fun: Pterm)
@@ -33,7 +39,7 @@ pub type Pterm {
   Unit
   // syntaxe Deref(var) : !var 
   Deref(var: Pterm)
-  // syntaxe Ref(init) : ref init
+  // syntaxe Ref(init) : Ref init
   Ref(init: Pterm)
   // syntaxe Assign(ref, expr) : ref := expr
   Assign(ref: Pterm, expr: Pterm)
@@ -47,10 +53,13 @@ pub type Pterm {
   Recv(chan: Pterm)
   // syntaxe Str("a") : "a"
   Str(content: String)
-  // syntaxe Print(expr) : print(expr)
+  // syntaxe Print(expr) : Print(expr)
   Print(expr: Pterm)
-  // syntaxe Println(expr) : println(expr)
+  // syntaxe Println(expr) : Println(expr)
   Println(expr: Pterm)
+
+  Object(fields: List(Field))
+  Call(expr: Pterm, name: String)
 }
 
 fn string_of_term_app(term: Pterm, ident: Int) -> String {
@@ -89,6 +98,11 @@ pub fn string_of_term(term: Pterm, ident: Int) -> String {
       let str_expr1 = string_of_term_app(expr1, ident)
       let str_expr2 = string_of_term_app(expr2, ident)
       string.concat([str_expr1, " + ", str_expr2])
+    }
+    Sub(expr1, expr2) -> {
+      let str_expr1 = string_of_term_app(expr1, ident)
+      let str_expr2 = string_of_term_app(expr2, ident)
+      string.concat([str_expr1, " - ", str_expr2])
     }
     Empty -> "[]"
     Cons(elem, rest) -> {
@@ -170,7 +184,31 @@ pub fn string_of_term(term: Pterm, ident: Int) -> String {
     Print(expr) -> string.concat(["print(", string_of_term(expr, ident), ")"])
     Println(expr) ->
       string.concat(["println(", string_of_term(expr, ident), ")"])
+    Object(fields) -> {
+      string.concat([
+        "-----------------------------------------------------------------------------\n",
+        "                                 Object\n",
+        string_of_fields(fields, ident),
+        "\n-----------------------------------------------------------------------------",
+      ])
+    }
+    Call(obj, name) -> {
+      string.concat([string_of_term(obj, ident), ".", name])
+    }
   }
+}
+
+fn string_of_fields(fields: List(Field), ident: Int) -> String {
+  list.map(fields, fn(field) {
+    string.concat([
+      "field ",
+      field.name,
+      "{",
+      string_of_term(field.body, ident),
+      "}\n",
+    ])
+  })
+  |> string.concat
 }
 
 fn string_of_term_cons(term: Pterm, ident: Int) -> String {
@@ -185,60 +223,5 @@ fn string_of_term_cons(term: Pterm, ident: Int) -> String {
     Empty -> "]"
     Deref(t) -> string.concat([", ..!", string_of_term(t, ident), "]"])
     _ -> string.append(string_of_term(term, ident), "]")
-  }
-}
-
-fn is_partial_application(term: Pterm) -> Bool {
-  case term {
-    App(fun, _) -> term_depth(fun, dict.new(), 0) > 1
-    _ -> False
-  }
-}
-
-// 
-fn term_depth(term: Pterm, env: dict.Dict(String, Int), cpt: Int) -> Int {
-  case term {
-    Var(name) -> {
-      let assert Ok(depth) = dict.get(env, name)
-      depth + cpt
-    }
-    Let(name, bind, expr) -> {
-      let new_env = dict.insert(env, name, term_depth(bind, env, 0))
-      term_depth(expr, new_env, cpt)
-    }
-    Abs(_, fun) -> term_depth(fun, env, cpt + 1)
-    App(fun, _) -> term_depth(fun, env, cpt - 1)
-    Head(expr) -> term_depth(expr, env, cpt)
-    Cons(expr, _) -> term_depth(expr, env, cpt)
-    Deref(expr) -> term_depth(expr, env, cpt)
-    Ifz(_, then, _) -> term_depth(then, env, cpt)
-    Ife(_, then, _) -> term_depth(then, env, cpt)
-    Rec(name, fun) -> {
-      let new_env = dict.insert(env, name, 0)
-      term_depth(fun, new_env, cpt)
-    }
-    _ -> cpt
-  }
-}
-
-// si on déclare qu'un terme est expansif, alors on va appliquer du polymorphisme faible
-// si on a déclarer du polymorphisme faible pour un term expansif, il n'y aura pas de changement
-// lors de l'unification
-// TODO: approfondir défintion d'expansif
-pub fn is_expansive(term: Pterm) -> Bool {
-  case term {
-    App(t1, t2) ->
-      is_partial_application(term) || is_expansive(t1) || is_expansive(t2)
-    Let(_, _, expr) -> is_expansive(expr)
-    // is then but els is not expansive typing should probably not work
-    Ife(_, then, els) -> is_expansive(then) || is_expansive(els)
-    Ifz(_, then, els) -> is_expansive(then) || is_expansive(els)
-    Ref(_) -> True
-    Fork(expr1, expr2) -> is_expansive(expr1) || is_expansive(expr2)
-    Chan -> True
-    Send(_, _) -> True
-    // TODO: careful
-    Recv(_) -> True
-    _ -> False
   }
 }

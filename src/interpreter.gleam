@@ -23,97 +23,113 @@ fn eval_add(
   }
 }
 
-fn eval_app(
+fn eval_sub(
+  t1: term.Pterm,
+  t2: term.Pterm,
+  mem: memory.MemoryActor,
+) -> Result(term.Pterm, InterpreterError) {
+  use v1 <- result.try(eval_term(t1, mem))
+  use v2 <- result.try(eval_term(t2, mem))
+  case v1, v2 {
+    term.Integer(i1), term.Integer(i2) -> Ok(term.Integer(i1 - i2))
+    _, _ -> Ok(term.Sub(v1, v2))
+  }
+}
+
+fn substitute_var(
   var: String,
   arg: term.Pterm,
   body: term.Pterm,
-  mem: memory.MemoryActor,
 ) -> Result(term.Pterm, InterpreterError) {
   case body {
     term.Var(name) if name == var -> Ok(arg)
     term.Var(_) -> Ok(body)
     term.Abs(name, new_body) if name != var -> {
-      use new_term <- result.try(eval_app(var, arg, new_body, mem))
-      use eval <- result.try(eval_term(new_term, mem))
-      Ok(term.Abs(name, eval))
+      use new_term <- result.try(substitute_var(var, arg, new_body))
+      Ok(term.Abs(name, new_term))
     }
     term.App(term1, term2) -> {
-      use new_term1 <- result.try(eval_app(var, arg, term1, mem))
-      use new_term2 <- result.try(eval_app(var, arg, term2, mem))
+      use new_term1 <- result.try(substitute_var(var, arg, term1))
+      use new_term2 <- result.try(substitute_var(var, arg, term2))
       Ok(term.App(new_term1, new_term2))
     }
     term.Add(term1, term2) -> {
-      use new_term1 <- result.try(eval_app(var, arg, term1, mem))
-      use new_term2 <- result.try(eval_app(var, arg, term2, mem))
+      use new_term1 <- result.try(substitute_var(var, arg, term1))
+      use new_term2 <- result.try(substitute_var(var, arg, term2))
       Ok(term.Add(new_term1, new_term2))
     }
+    term.Sub(term1, term2) -> {
+      use new_term1 <- result.try(substitute_var(var, arg, term1))
+      use new_term2 <- result.try(substitute_var(var, arg, term2))
+      Ok(term.Sub(new_term1, new_term2))
+    }
     term.Cons(t1, rest) -> {
-      use new_t1 <- result.try(eval_app(var, arg, t1, mem))
-      use new_rest <- result.try(eval_app(var, arg, rest, mem))
+      use new_t1 <- result.try(substitute_var(var, arg, t1))
+      use new_rest <- result.try(substitute_var(var, arg, rest))
       Ok(term.Cons(new_t1, new_rest))
     }
     term.Head(t) -> {
-      use new_t <- result.try(eval_app(var, arg, t, mem))
+      use new_t <- result.try(substitute_var(var, arg, t))
       Ok(term.Head(new_t))
     }
     term.Tail(t) -> {
-      use new_t <- result.try(eval_app(var, arg, t, mem))
+      use new_t <- result.try(substitute_var(var, arg, t))
       Ok(term.Tail(new_t))
     }
     term.Ref(t) -> {
-      use new_t <- result.try(eval_app(var, arg, t, mem))
+      use new_t <- result.try(substitute_var(var, arg, t))
       Ok(term.Ref(new_t))
     }
     term.Ife(cond, then, els) -> {
-      use new_cond <- result.try(eval_app(var, arg, cond, mem))
-      use new_then <- result.try(eval_app(var, arg, then, mem))
-      use new_else <- result.try(eval_app(var, arg, els, mem))
+      use new_cond <- result.try(substitute_var(var, arg, cond))
+      use new_then <- result.try(substitute_var(var, arg, then))
+      use new_else <- result.try(substitute_var(var, arg, els))
       Ok(term.Ife(new_cond, new_then, new_else))
     }
     term.Ifz(cond, then, els) -> {
-      use new_cond <- result.try(eval_app(var, arg, cond, mem))
-      use new_then <- result.try(eval_app(var, arg, then, mem))
-      use new_else <- result.try(eval_app(var, arg, els, mem))
+      use new_cond <- result.try(substitute_var(var, arg, cond))
+      use new_then <- result.try(substitute_var(var, arg, then))
+      use new_else <- result.try(substitute_var(var, arg, els))
       Ok(term.Ifz(new_cond, new_then, new_else))
     }
     term.Assign(ref, expr) -> {
-      use new_ref <- result.try(eval_app(var, arg, ref, mem))
-      use new_expr <- result.try(eval_app(var, arg, expr, mem))
+      use new_ref <- result.try(substitute_var(var, arg, ref))
+      use new_expr <- result.try(substitute_var(var, arg, expr))
       Ok(term.Assign(new_ref, new_expr))
     }
     term.Deref(ref) -> {
-      use new_ref <- result.try(eval_app(var, arg, ref, mem))
+      use new_ref <- result.try(substitute_var(var, arg, ref))
       Ok(term.Deref(new_ref))
     }
     term.Fork(expr1, expr2) -> {
-      use new_expr1 <- result.try(eval_app(var, arg, expr1, mem))
-      use new_expr2 <- result.try(eval_app(var, arg, expr2, mem))
+      use new_expr1 <- result.try(substitute_var(var, arg, expr1))
+      use new_expr2 <- result.try(substitute_var(var, arg, expr2))
       Ok(term.Fork(new_expr1, new_expr2))
     }
     term.Let(name, bind, expr) if name != var -> {
-      use new_bind <- result.try(eval_app(var, arg, bind, mem))
-      use new_expr <- result.try(eval_app(var, arg, expr, mem))
+      use new_bind <- result.try(substitute_var(var, arg, bind))
+      use new_expr <- result.try(substitute_var(var, arg, expr))
       Ok(term.Let(name, new_bind, new_expr))
     }
     term.Print(expr) -> {
-      use new_expr <- result.try(eval_app(var, arg, expr, mem))
+      use new_expr <- result.try(substitute_var(var, arg, expr))
       Ok(term.Print(new_expr))
     }
     term.Println(expr) -> {
-      use new_expr <- result.try(eval_app(var, arg, expr, mem))
+      use new_expr <- result.try(substitute_var(var, arg, expr))
       Ok(term.Println(new_expr))
     }
     term.Rec(name, fun) if name != var -> {
-      use new_fun <- result.try(eval_app(var, arg, fun, mem))
+      use new_fun <- result.try(substitute_var(var, arg, fun))
       Ok(term.Rec(name, new_fun))
     }
     term.Send(chan, _) -> {
-      use new_chan <- result.try(eval_app(var, arg, chan, mem))
-      use new_content <- result.try(eval_app(var, arg, chan, mem))
+      use new_chan <- result.try(substitute_var(var, arg, chan))
+      use new_content <- result.try(substitute_var(var, arg, chan))
       Ok(term.Send(new_chan, new_content))
     }
     term.Recv(chan) -> {
-      use new_chan <- result.try(eval_app(var, arg, chan, mem))
+      use new_chan <- result.try(substitute_var(var, arg, chan))
       Ok(term.Recv(new_chan))
     }
     term.Str(_)
@@ -123,7 +139,9 @@ fn eval_app(
     | term.Rec(_, _)
     | term.Unit
     | term.Chan
-    | term.Empty -> Ok(body)
+    | term.Empty
+    | term.Object(_)
+    | term.Call(_, _) -> Ok(body)
   }
 }
 
@@ -150,10 +168,11 @@ pub fn eval_ifz(
   mem: memory.MemoryActor,
 ) -> Result(term.Pterm, InterpreterError) {
   use cond_val <- result.try(eval_term(cond, mem))
+  echo cond_val
   case cond_val {
     term.Integer(n) if n == 0 -> eval_term(then, mem)
     term.Integer(_) -> eval_term(els, mem)
-    _ -> panic as "should not happen"
+    _ -> panic as "nope"
   }
 }
 
@@ -167,7 +186,7 @@ pub fn eval_ife(
   case cond_val {
     term.Empty -> eval_term(then, mem)
     term.Cons(_, _) -> eval_term(els, mem)
-    _ -> panic as "should not happen"
+    _ -> Ok(term.Ife(cond_val, then, els))
   }
 }
 
@@ -194,7 +213,7 @@ pub fn eval_term(
 ) -> Result(term.Pterm, InterpreterError) {
   case term {
     term.App(term.Abs(var, t), arg) -> {
-      use new_term <- result.try(eval_app(var, arg, t, memory))
+      use new_term <- result.try(substitute_var(var, arg, t))
       eval_term(new_term, memory)
     }
     term.App(t1, t2) -> {
@@ -203,6 +222,7 @@ pub fn eval_term(
       eval_term(term.App(new_t1, new_t2), memory)
     }
     term.Add(t1, t2) -> eval_add(t1, t2, memory)
+    term.Sub(t1, t2) -> eval_sub(t1, t2, memory)
     term.Cons(t, rest) -> {
       use new_term <- result.try(eval_term(t, memory))
       Ok(term.Cons(new_term, rest))
@@ -230,13 +250,13 @@ pub fn eval_term(
           eval_term(expr, memory)
         }
         _ -> {
-          use new_expr <- result.try(eval_app(var, new_bind, expr, memory))
+          use new_expr <- result.try(substitute_var(var, new_bind, expr))
           eval_term(new_expr, memory)
         }
       }
     }
     // TODO
-    term.Rec(var, fun) -> eval_app(var, term, fun, memory)
+    term.Rec(var, fun) -> substitute_var(var, term, fun)
     term.Deref(expr) -> {
       use ref <- result.try(eval_term(expr, memory))
       case ref {
